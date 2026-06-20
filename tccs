@@ -109,10 +109,11 @@ def find_initialized_shell_config() -> Optional[Path]:
     return None
 
 
-def cmd_init() -> int:
+def cmd_init(force: bool = False) -> int:
     existing = find_initialized_shell_config()
-    if existing is not None:
+    if existing is not None and not force:
         print("tccs-switch 已存在于 {}，无需重复初始化。".format(existing))
+        print("如需重新初始化，请使用 tccs --reinit。")
         return 0
 
     candidates = shell_config_candidates()
@@ -120,6 +121,15 @@ def cmd_init() -> int:
     target = existing_files[0] if existing_files else candidates[0]
 
     content = target.read_text(encoding="utf-8") if target.exists() else ""
+    # 如果已存在旧的初始化块，先移除
+    if INIT_MARKER_START in content and force:
+        content = re.sub(
+            r"\n?" + re.escape(INIT_MARKER_START) + r".*?" + re.escape(INIT_MARKER_END),
+            "",
+            content,
+            flags=re.DOTALL,
+        )
+        print("已移除旧的 tccs 初始化块。", file=sys.stderr)
     if content and not content.endswith("\n"):
         content += "\n"
     content += "\n" + INIT_FUNCTION + "\n"
@@ -210,6 +220,31 @@ def cmd_switch(name: str) -> int:
     return 0
 
 
+def cmd_delete(name: str) -> int:
+    if not PROFILE_NAME_RE.fullmatch(name):
+        print("无效的 profile 名: {}".format(name), file=sys.stderr)
+        return 1
+    target = profile_path(name)
+    if not target.exists():
+        print("Profile 不存在: {}".format(name), file=sys.stderr)
+        profiles = list_profiles()
+        if profiles:
+            print("可用 profile: {}".format(", ".join(profiles)), file=sys.stderr)
+        else:
+            print_create_hint()
+        return 1
+    # 如果删除的是当前激活的 profile，同时清理符号链接
+    active = get_active_profile()
+    if active == name:
+        link = active_link()
+        if link.is_symlink():
+            link.unlink()
+        print("已取消激活。", file=sys.stderr)
+    target.unlink()
+    print("已删除 profile: {}".format(name))
+    return 0
+
+
 def cmd_export() -> int:
     active = get_active_profile()
     if active is None:
@@ -231,19 +266,41 @@ def cmd_export() -> int:
     return 0
 
 
+EPILOG = """\
+使用说明：
+  添加 profile      在 {dir} 下创建 JSON 文件，例如 {example}。
+                    文件内容为扁平键值对：{{"KEY": "value", ...}}
+  删除 profile      tccs -d <name>
+  列出所有 profile   tccs -a
+  切换 profile      tccs -s <name>          （或 eval "$(tccs -s <name>)" 使其立即生效）
+  查看当前 profile   tccs -l
+  导出环境变量       tccs -e                （或 eval "$(tccs -e)"）
+  初始化 shell       tccs                   （首次使用）
+  重新初始化         tccs --reinit          （更新 shell 函数或修复问题）""".format(
+    dir=tccs_dir(), example=profile_path("example").name
+)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tccs",
         description="Tiny Claude Code Switch: manage LLM provider profiles.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-l", action="store_true", help="显示当前激活 profile")
     parser.add_argument("-a", action="store_true", help="列出所有 profile")
     parser.add_argument("-s", metavar="NAME", help="切换到指定 profile 并输出 export 语句")
+    parser.add_argument("-d", metavar="NAME", help="删除指定 profile")
     parser.add_argument("-e", "--export", action="store_true", help="输出当前激活 profile 的 export 语句")
+    parser.add_argument("--reinit", action="store_true", help="强制重新初始化 shell 集成")
 
     args = parser.parse_args(argv)
 
-    if not (args.l or args.a or args.s is not None or args.export):
+    if args.reinit:
+        return cmd_init(force=True)
+
+    if not (args.l or args.a or args.s is not None or args.d is not None or args.export):
         return cmd_init()
 
     ensure_tccs_dir()
@@ -255,6 +312,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_list_all()
         if args.s is not None:
             return cmd_switch(args.s)
+        if args.d is not None:
+            return cmd_delete(args.d)
         if args.export:
             return cmd_export()
     except (ValueError, FileNotFoundError) as e:
