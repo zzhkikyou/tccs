@@ -1,75 +1,232 @@
 # tccs — Tiny Claude Code Switch
 
-在多个 LLM 提供商之间快速切换，一键导出对应的环境变量。
+> One-command profile switching for LLM provider environment variables.
 
-## 安装
+![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
+![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+
+**tccs** (Tiny Claude Code Switch) is a single-file Python CLI that lets you manage multiple LLM provider profiles and switch between them instantly. Each profile is a JSON file of environment variables; activating a profile updates a symlink and exports the variables into your current shell.
+
+## Table of Contents
+
+- [Why tccs?](#why-tccs)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Command Reference](#command-reference)
+- [Usage Examples](#usage-examples)
+- [How It Works](#how-it-works)
+- [Claude Code Integration Notes](#claude-code-integration-notes)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+## Why tccs?
+
+- **Single-file, stdlib-only Python 3 script** — no packages to install.
+- **Profile isolation** — keep each provider's keys, model names, and settings in its own JSON file.
+- **Instant switching** — `tccs-switch <profile>` applies the new env vars in the current shell.
+- **Claude Code aware** — optionally clears the `env` block in Claude Code's `settings.json` so shell variables remain the source of truth.
+
+## Installation
 
 ```bash
-# 克隆仓库
+# Clone the repository
 git clone git@gitee.com:zzhkikyou/tccs.git
+cd tccs
 
-# 放到 PATH 中（可选），例如：
+# Make it executable
+chmod +x tccs
+
+# Optional: add to your PATH
+mkdir -p ~/.local/bin
 ln -s "$(pwd)/tccs" ~/.local/bin/tccs
 ```
 
-依赖：Python 3.6+，无第三方库。
+Requirements: **Python 3.6+**, no third-party dependencies.
 
-## 快速开始
+## Quick Start
 
-**1. 初始化 shell 集成**
+**1. Run the setup wizard**
 
 ```bash
 ./tccs
 ```
 
-此命令会将 `tccs-switch` 和 `tccs-refresh` 函数写入你的 shell 配置文件（`.bashrc` / `.zshrc`）。
+This injects `tccs-switch` and `tccs-refresh` shell functions into your shell config file (`.bashrc`, `.bash_profile`, or `.zshrc`). It also creates an example profile under `~/.tccs/`.
 
-**2. 创建 profile**
+**2. Add your first profile**
 
-Profile 是 `~/.tccs/llm_<name>.json` 文件，内容为扁平的环境变量键值对：
+```bash
+./tccs -a
+```
+
+You will be prompted for a profile name and `$EDITOR` will open a template. Fill in real values, save, and exit.
+
+Alternatively, create a profile manually:
+
+```bash
+cp ~/.tccs/llm_example.json ~/.tccs/llm_anthropic.json
+# edit ~/.tccs/llm_anthropic.json with your real keys
+```
+
+Example profile (`~/.tccs/llm_anthropic.json`):
 
 ```json
 {
   "ANTHROPIC_API_KEY": "sk-ant-xxx",
-  "ANTHROPIC_MODEL": "claude-sonnet-4-6"
+  "ANTHROPIC_MODEL": "claude-sonnet-4-20250514",
+  "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
 }
 ```
 
-**3. 切换并激活**
+**3. Switch profiles**
 
 ```bash
-tccs-switch anthropic    # 需要先完成第 1 步的初始化
+tccs-switch anthropic
 ```
 
-或者直接：
+Or, without the shell helper:
 
 ```bash
-eval "$(./tccs -s anthropic)"
+eval "$(./tccs -w anthropic)"
 ```
 
-## 命令参考
+## Command Reference
 
-| 命令 | 说明 |
-|------|------|
-| `./tccs` | 初始化，将 shell 函数注入配置文件 |
-| `./tccs -a` | 列出所有 profile |
-| `./tccs -l` | 显示当前激活的 profile 及其变量 |
-| `./tccs -s NAME` | 切换到指定 profile，输出 `export` 语句 |
-| `./tccs -e` | 输出当前已激活 profile 的 `export` 语句 |
+### CLI commands
 
-## 工作原理
+| Command | Description |
+|---------|-------------|
+| `./tccs` | Run the interactive setup wizard |
+| `./tccs -r` | Re-run setup (update shell integration) |
+| `./tccs -s`, `--show` | List all profiles |
+| `./tccs -l` | Show the active profile and its environment variables |
+| `./tccs -w <name>` | Switch to profile `name` and print `export` statements |
+| `./tccs -a`, `--add` | Add a new profile interactively |
+| `./tccs -e [<name>]`, `--edit [<name>]` | Edit a profile interactively |
+| `./tccs -d <name>` | Delete a profile |
+
+### Shell helpers
+
+After setup, these functions are available in every new shell:
+
+| Function | Description |
+|----------|-------------|
+| `tccs-switch <name>` | Switch to profile `name` and apply env vars in the current shell |
+| `tccs-refresh` | Reload the currently active profile |
+
+## Usage Examples
+
+### Add and switch to an Anthropic profile
+
+```bash
+./tccs -a
+# Profile name: anthropic
+# Fill in ANTHROPIC_API_KEY, ANTHROPIC_MODEL, etc.
+
+tccs-switch anthropic
+```
+
+### Switch between providers
+
+```bash
+# List available profiles
+./tccs -s
+
+# Switch to OpenAI
+./tccs -w openai        # prints export statements
+tccs-switch openai      # applies them in the current shell
+```
+
+### Edit the active profile and refresh
+
+```bash
+./tccs -e anthropic     # edit in $EDITOR
+tccs-refresh            # reload env vars in current shell
+```
+
+### Delete a profile
+
+```bash
+./tccs -d old_profile
+```
+
+## How It Works
+
+`tccs` stores each profile as a flat JSON file under `~/.tccs/`:
 
 ```
 ~/.tccs/
-├── llm.json -> llm_anthropic.json   # 符号链接，指向当前激活的 profile
-├── llm_anthropic.json               # profile 文件
+├── llm.json -> llm_anthropic.json   # symlink to the active profile
+├── config.json                       # tccs preferences
+├── llm_example.json                  # template profile
+├── llm_anthropic.json
 ├── llm_openai.json
 └── llm_gemini.json
 ```
 
-- `tccs -s <name>` 更新符号链接并输出 `export` 行
-- `tccs -e` 读取当前符号链接指向的 profile 并输出 `export` 行
-- shell 函数 `tccs-switch` / `tccs-refresh` 封装了 `eval "$(tccs ...)"`，使环境变量在当前会话立即生效
+Each profile contains `{"KEY": "value"}` pairs that are exported as environment variables:
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-xxx'
+export ANTHROPIC_MODEL='claude-sonnet-4-20250514'
+```
+
+When you run `tccs-switch <name>`, the shell function calls:
+
+```bash
+eval "$(tccs -w <name>)"
+```
+
+This updates the `~/.tccs/llm.json` symlink and evaluates the exported variables in the current shell session.
+
+## Claude Code Integration Notes
+
+During setup, `tccs` asks whether to **clear the `env` block in Claude Code's `settings.json` on every switch**. When enabled:
+
+- `tccs -w <name>` sets `settings.json` `"env"` to `{}`.
+- Your shell environment variables become the single source of truth for API keys and model settings.
+- This avoids stale values lingering in Claude Code's own config.
+
+You can change this later by re-running `./tccs -r` or by editing `~/.tccs/config.json`:
+
+```json
+{
+  "sync_env": true
+}
+```
+
+## Troubleshooting
+
+### `tccs-switch: command not found`
+
+The shell functions are only available after setup and in shells started **after** the config file was sourced. Run:
+
+```bash
+source ~/.bashrc   # or ~/.zshrc
+```
+
+### Profile not found
+
+Make sure the JSON file exists as `~/.tccs/llm_<name>.json` and the name uses only letters, digits, underscores, and hyphens. List profiles with:
+
+```bash
+./tccs -s
+```
+
+### `settings.json` env is not clearing
+
+Check that `sync_env` is enabled:
+
+```bash
+cat ~/.tccs/config.json
+```
+
+If it is `false`, re-run setup:
+
+```bash
+./tccs -r
+```
 
 ## License
 
