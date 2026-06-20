@@ -29,7 +29,7 @@ tccs-refresh() {{
     eval "$(tccs -e)"
 }}
 
-# 自动激活 tccs 当前 profile
+# Auto-activate current tccs profile
 if declare -f tccs-refresh &>/dev/null; then
     tccs-refresh
 fi
@@ -88,7 +88,7 @@ def load_profile(name: str) -> Dict[str, str]:
         raise ValueError("Profile {}: expected JSON object".format(name))
     for k, v in data.items():
         if not isinstance(v, str):
-            raise ValueError("Profile {}: 所有值必须是字符串".format(name))
+            raise ValueError("Profile {}: all values must be strings".format(name))
     return {str(k): v for k, v in data.items()}
 
 
@@ -112,8 +112,8 @@ def find_initialized_shell_config() -> Optional[Path]:
 def cmd_init(force: bool = False) -> int:
     existing = find_initialized_shell_config()
     if existing is not None and not force:
-        print("tccs-switch 已存在于 {}，无需重复初始化。".format(existing))
-        print("如需重新初始化，请使用 tccs --reinit。")
+        print("tccs-switch already exists in {}, no need to reinitialize.".format(existing))
+        print("Use tccs --reinit to force reinitialization.")
         return 0
 
     candidates = shell_config_candidates()
@@ -121,7 +121,7 @@ def cmd_init(force: bool = False) -> int:
     target = existing_files[0] if existing_files else candidates[0]
 
     content = target.read_text(encoding="utf-8") if target.exists() else ""
-    # 如果已存在旧的初始化块，先移除
+    # If old init block exists, remove it first
     if INIT_MARKER_START in content and force:
         content = re.sub(
             r"\n?" + re.escape(INIT_MARKER_START) + r".*?" + re.escape(INIT_MARKER_END),
@@ -129,21 +129,21 @@ def cmd_init(force: bool = False) -> int:
             content,
             flags=re.DOTALL,
         )
-        print("已移除旧的 tccs 初始化块。", file=sys.stderr)
+        print("Removed old tccs init block.", file=sys.stderr)
     if content and not content.endswith("\n"):
         content += "\n"
     content += "\n" + INIT_FUNCTION + "\n"
     target.write_text(content, encoding="utf-8")
-    print("已写入 {}。请执行：".format(target))
+    print("Written to {}. Please run:".format(target))
     print("    source {}".format(target))
-    print("之后即可使用 tccs-switch <profile>。")
-    print("tccs-refresh 与自动激活已配置，进入 bash 时将自动生效当前 profile。")
+    print("After that, you can use tccs-switch <profile>.")
+    print("tccs-refresh and auto-activation configured; current profile will be auto-applied on bash start.")
     return 0
 
 
 def print_create_hint() -> None:
     print(
-        "提示：在 {} 下创建 JSON 文件作为 profile，例如 {}。".format(
+        "Hint: create JSON files under {} as profiles, e.g. {}.".format(
             tccs_dir(), profile_path("example").name
         ),
         file=sys.stderr,
@@ -157,7 +157,7 @@ def print_no_profile_hint() -> None:
         print_create_hint()
     elif active is None:
         print(
-            "提示：使用 tccs -s <name> 激活一个 profile。可用 profile：{}".format(
+            "Hint: use tccs -s <name> to activate a profile. Available profiles: {}".format(
                 ", ".join(profiles)
             ),
             file=sys.stderr,
@@ -170,15 +170,15 @@ def print_no_profile_hint() -> None:
 def cmd_list() -> int:
     active = get_active_profile()
     if active is None:
-        print("当前没有激活的 profile。")
+        print("No active profile.")
         print_no_profile_hint()
         return 0
     target = profile_path(active)
     if not target.exists():
-        print("当前激活的 profile 文件不存在: {}".format(active), file=sys.stderr)
+        print("Active profile file not found: {}".format(active), file=sys.stderr)
         print_create_hint()
         return 1
-    print("当前激活 profile: {}".format(active))
+    print("Active profile: {}".format(active))
     data = load_profile(active)
     for key in sorted(data.keys()):
         print("  {}={}".format(key, data[key]))
@@ -189,7 +189,7 @@ def cmd_list_all() -> int:
     active = get_active_profile()
     profiles = list_profiles()
     if not profiles:
-        print("没有找到任何 profile。")
+        print("No profiles found.")
         print_create_hint()
         return 0
     for name in profiles:
@@ -200,14 +200,14 @@ def cmd_list_all() -> int:
 
 def cmd_switch(name: str) -> int:
     if not PROFILE_NAME_RE.fullmatch(name):
-        print("无效的 profile 名: {}".format(name), file=sys.stderr)
+        print("Invalid profile name: {}".format(name), file=sys.stderr)
         return 1
     target = profile_path(name)
     if not target.exists():
-        print("Profile 不存在: {}".format(name), file=sys.stderr)
+        print("Profile not found: {}".format(name), file=sys.stderr)
         profiles = list_profiles()
         if profiles:
-            print("可用 profile: {}".format(", ".join(profiles)), file=sys.stderr)
+            print("Available profiles: {}".format(", ".join(profiles)), file=sys.stderr)
         else:
             print_create_hint()
         return 1
@@ -222,61 +222,61 @@ def cmd_switch(name: str) -> int:
 
 def cmd_delete(name: str) -> int:
     if not PROFILE_NAME_RE.fullmatch(name):
-        print("无效的 profile 名: {}".format(name), file=sys.stderr)
+        print("Invalid profile name: {}".format(name), file=sys.stderr)
         return 1
     target = profile_path(name)
     if not target.exists():
-        print("Profile 不存在: {}".format(name), file=sys.stderr)
+        print("Profile not found: {}".format(name), file=sys.stderr)
         profiles = list_profiles()
         if profiles:
-            print("可用 profile: {}".format(", ".join(profiles)), file=sys.stderr)
+            print("Available profiles: {}".format(", ".join(profiles)), file=sys.stderr)
         else:
             print_create_hint()
         return 1
-    # 如果删除的是当前激活的 profile，同时清理符号链接
+    # If deleting the active profile, clean up the symlink too
     active = get_active_profile()
     if active == name:
         link = active_link()
         if link.is_symlink():
             link.unlink()
-        print("已取消激活。", file=sys.stderr)
+        print("Deactivated.", file=sys.stderr)
     target.unlink()
-    print("已删除 profile: {}".format(name))
+    print("Deleted profile: {}".format(name))
     return 0
 
 
 def cmd_export() -> int:
     active = get_active_profile()
     if active is None:
-        print("当前没有激活的 profile。", file=sys.stderr)
+        print("No active profile.", file=sys.stderr)
         print_no_profile_hint()
         return 1
     target = profile_path(active)
     if not target.exists():
-        print("当前激活的 profile 文件不存在: {}".format(active), file=sys.stderr)
+        print("Active profile file not found: {}".format(active), file=sys.stderr)
         return 1
     data = load_profile(active)
     print_exports(data)
     if sys.stdout.isatty():
         print("", file=sys.stderr)
-        print("提示：运行以下命令使环境变量立即生效：", file=sys.stderr)
+        print("Hint: run the following to apply environment variables immediately:", file=sys.stderr)
         print("    eval \"$(tccs -e)\"", file=sys.stderr)
-        print("如果已初始化，也可直接运行：", file=sys.stderr)
+        print("If already initialized, you can also run:", file=sys.stderr)
         print("    tccs-refresh", file=sys.stderr)
     return 0
 
 
 EPILOG = """\
-使用说明：
-  添加 profile      在 {dir} 下创建 JSON 文件，例如 {example}。
-                    文件内容为扁平键值对：{{"KEY": "value", ...}}
-  删除 profile      tccs -d <name>
-  列出所有 profile   tccs -a
-  切换 profile      tccs -s <name>          （或 eval "$(tccs -s <name>)" 使其立即生效）
-  查看当前 profile   tccs -l
-  导出环境变量       tccs -e                （或 eval "$(tccs -e)"）
-  初始化 shell       tccs                   （首次使用）
-  重新初始化         tccs --reinit          （更新 shell 函数或修复问题）""".format(
+Usage:
+  Add profile       Create a JSON file under {dir}, e.g. {example}.
+                    File content as flat key-value pairs: {{"KEY": "value", ...}}
+  Delete profile    tccs -d <name>
+  List profiles     tccs -a
+  Switch profile    tccs -s <name>          (or eval "$(tccs -s <name>)" to apply immediately)
+  Show current      tccs -l
+  Export env vars   tccs -e                 (or eval "$(tccs -e)")
+  Init shell        tccs                   (first-time setup)
+  Reinitialize      tccs --reinit          (update shell functions or fix issues)""".format(
     dir=tccs_dir(), example=profile_path("example").name
 )
 
@@ -288,12 +288,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-l", action="store_true", help="显示当前激活 profile")
-    parser.add_argument("-a", action="store_true", help="列出所有 profile")
-    parser.add_argument("-s", metavar="NAME", help="切换到指定 profile 并输出 export 语句")
-    parser.add_argument("-d", metavar="NAME", help="删除指定 profile")
-    parser.add_argument("-e", "--export", action="store_true", help="输出当前激活 profile 的 export 语句")
-    parser.add_argument("--reinit", action="store_true", help="强制重新初始化 shell 集成")
+    parser.add_argument("-l", action="store_true", help="Show active profile")
+    parser.add_argument("-a", action="store_true", help="List all profiles")
+    parser.add_argument("-s", metavar="NAME", help="Switch to profile and output export statements")
+    parser.add_argument("-d", metavar="NAME", help="Delete a profile")
+    parser.add_argument("-e", "--export", action="store_true", help="Output export statements for active profile")
+    parser.add_argument("--reinit", action="store_true", help="Force reinitialize shell integration")
 
     args = parser.parse_args(argv)
 
@@ -317,7 +317,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.export:
             return cmd_export()
     except (ValueError, FileNotFoundError) as e:
-        print("错误: {}".format(e), file=sys.stderr)
+        print("Error: {}".format(e), file=sys.stderr)
         return 1
 
     return 0
