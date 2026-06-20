@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Tiny Claude Code Switch: manage LLM provider profiles via env vars."""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+TCCS_DIR_NAME = ".tccs"
+ACTIVE_LINK_NAME = "llm.json"
+PROFILE_PREFIX = "llm_"
+PROFILE_SUFFIX = ".json"
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+SHELL_FILES = (".bashrc", ".bash_profile", ".zshrc")
+
+INIT_MARKER_START = "# >>> tccs initialized >>>"
+INIT_MARKER_END = "# <<< tccs initialized <<<"
+
+INIT_FUNCTION = """{start}
+tccs-switch() {{
+    eval "$(tccs -s \"$1\")"
+}}
+tccs-refresh() {{
+    eval "$(tccs -e)"
+}}
+
+# 自动激活 tccs 当前 profile
+if declare -f tccs-refresh &>/dev/null; then
+    tccs-refresh
+fi
+{end}
+""".format(start=INIT_MARKER_START, end=INIT_MARKER_END)
+
+
+def tccs_dir() -> Path:
+    return Path.home() / TCCS_DIR_NAME
+
+
+def active_link() -> Path:
+    return tccs_dir() / ACTIVE_LINK_NAME
+
+
+def ensure_tccs_dir() -> None:
+    d = tccs_dir()
+    if not d.exists():
+        d.mkdir(mode=0o700)
+    else:
+        d.chmod(0o700)
+
+
+def profile_path(name: str) -> Path:
+    return tccs_dir() / "{}{}{}".format(PROFILE_PREFIX, name, PROFILE_SUFFIX)
+
+
+def list_profiles() -> List[str]:
+    d = tccs_dir()
+    if not d.exists():
+        return []
+    profiles = []
+    for f in d.iterdir():
+        if f.is_file() and f.name.startswith(PROFILE_PREFIX) and f.name.endswith(PROFILE_SUFFIX):
+            name = f.name[len(PROFILE_PREFIX):-len(PROFILE_SUFFIX)]
+            profiles.append(name)
+    return sorted(profiles)
+
+
+def get_active_profile() -> Optional[str]:
+    link = active_link()
+    if not link.is_symlink():
+        return None
+    target_name = os.readlink(str(link))
+    name = os.path.basename(target_name)
+    if name.startswith(PROFILE_PREFIX) and name.endswith(PROFILE_SUFFIX):
+        return name[len(PROFILE_PREFIX):-len(PROFILE_SUFFIX)]
+    return None
+
+
+def load_profile(name: str) -> Dict[str, str]:
+    p = profile_path(name)
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Profile {}: expected JSON object".format(name))
+    for k, v in data.items():
+        if not isinstance(v, str):
+            raise ValueError("Profile {}: 所有值必须是字符串".format(name))
+    return {str(k): v for k, v in data.items()}
+
+
+def print_exports(data: Dict[str, str]) -> None:
+    for key, value in data.items():
+        print('export {}={}'.format(key, shlex.quote(value)))
+
+
+def shell_config_candidates() -> List[Path]:
+    home = Path.home()
+    return [home / f for f in SHELL_FILES]
+
+
+def find_initialized_shell_config() -> Optional[Path]:
+    for p in shell_config_candidates():
+        if p.exists() and INIT_MARKER_START in p.read_text(encoding="utf-8"):
+            return p
+    return None
+
+
+def cmd_init() -> int:
+    existing = find_initialized_shell_config()
+    if existing is not None:
+        print("tccs-switch 已存在于 {}，无需重复初始化。".format(existing))
+        return 0
+
+    candidates = shell_config_candidates()
+    existing_files = [p for p in candidates if p.exists()]
+    target = existing_files[0] if existing_files else candidates[0]
+
+    content = target.read_text(encoding="utf-8") if target.exists() else ""
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content += "\n" + INIT_FUNCTION + "\n"
+    target.write_text(content, encoding="utf-8")
+    print("已写入 {}。请执行：".format(target))
+    print("    source {}".format(target))
+    print("之后即可使用 tccs-switch <profile>。")
+    print("tccs-refresh 与自动激活已配置，进入 bash 时将自动生效当前 profile。")
+    return 0
+
+
+def cmd_list() -> int:
+    active = get_active_profile()
+    if active is None:
+        print("当前没有激活的 profile。")
+        return 0
+    target = profile_path(active)
+    if not target.exists():
+        print("当前激活的 profile 文件不存在: {}".format(active), file=sys.stderr)
+        return 1
+    print("当前激活 profile: {}".format(active))
+    data = load_profile(active)
+    for key in sorted(data.keys()):
+        print("  {}={}".format(key, data[key]))
+    return 0
+
+
+def cmd_list_all() -> int:
+    active = get_active_profile()
+    profiles = list_profiles()
+    if not profiles:
+        print("没有找到任何 profile。")
+        return 0
+    for name in profiles:
+        marker = "* " if name == active else "  "
+        print("{}{}".format(marker, name))
+    return 0
+
+
+def cmd_switch(name: str) -> int:
+    if not PROFILE_NAME_RE.fullmatch(name):
+        print("无效的 profile 名: {}".format(name), file=sys.stderr)
+        return 1
+    target = profile_path(name)
+    if not target.exists():
+        print("Profile 不存在: {}".format(name), file=sys.stderr)
+        return 1
+    link = active_link()
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(target.name)
+    data = load_profile(name)
+    print_exports(data)
+    return 0
+
+
+def cmd_export() -> int:
+    active = get_active_profile()
+    if active is None:
+        print("当前没有激活的 profile。", file=sys.stderr)
+        return 1
+    target = profile_path(active)
+    if not target.exists():
+        print("当前激活的 profile 文件不存在: {}".format(active), file=sys.stderr)
+        return 1
+    data = load_profile(active)
+    print_exports(data)
+    if sys.stdout.isatty():
+        print("", file=sys.stderr)
+        print("提示：运行以下命令使环境变量立即生效：", file=sys.stderr)
+        print("    eval \"$(tccs -e)\"", file=sys.stderr)
+        print("如果已初始化，也可直接运行：", file=sys.stderr)
+        print("    tccs-refresh", file=sys.stderr)
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="tccs",
+        description="Tiny Claude Code Switch: manage LLM provider profiles.",
+    )
+    parser.add_argument("-l", action="store_true", help="显示当前激活 profile")
+    parser.add_argument("-a", action="store_true", help="列出所有 profile")
+    parser.add_argument("-s", metavar="NAME", help="切换到指定 profile 并输出 export 语句")
+    parser.add_argument("-e", "--export", action="store_true", help="输出当前激活 profile 的 export 语句")
+
+    args = parser.parse_args(argv)
+
+    if not (args.l or args.a or args.s is not None or args.export):
+        return cmd_init()
+
+    ensure_tccs_dir()
+
+    try:
+        if args.l:
+            return cmd_list()
+        if args.a:
+            return cmd_list_all()
+        if args.s is not None:
+            return cmd_switch(args.s)
+        if args.export:
+            return cmd_export()
+    except (ValueError, FileNotFoundError) as e:
+        print("错误: {}".format(e), file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
