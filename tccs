@@ -113,7 +113,7 @@ def cmd_init(force: bool = False) -> int:
     existing = find_initialized_shell_config()
     if existing is not None and not force:
         print("tccs-switch already exists in {}, no need to reinitialize.".format(existing))
-        print("Use tccs --reinit to force reinitialization.")
+        print("Use tccs -r to force reinitialization.")
         return 0
 
     candidates = shell_config_candidates()
@@ -276,7 +276,7 @@ Usage:
   Show current      tccs -l
   Export env vars   tccs -e                 (or eval "$(tccs -e)")
   Init shell        tccs                   (first-time setup)
-  Reinitialize      tccs --reinit          (update shell functions or fix issues)""".format(
+  Reinitialize      tccs -r                (update shell functions or fix issues)""".format(
     dir=tccs_dir(), example=profile_path("example").name
 )
 
@@ -293,7 +293,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("-s", metavar="NAME", help="Switch to profile and output export statements")
     parser.add_argument("-d", metavar="NAME", help="Delete a profile")
     parser.add_argument("-e", "--export", action="store_true", help="Output export statements for active profile")
-    parser.add_argument("--reinit", action="store_true", help="Force reinitialize shell integration")
+    parser.add_argument("-r", "--reinit", action="store_true", help="Force reinitialize shell integration")
 
     args = parser.parse_args(argv)
 
