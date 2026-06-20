@@ -131,14 +131,42 @@ def cmd_init() -> int:
     return 0
 
 
+def print_create_hint() -> None:
+    print(
+        "提示：在 {} 下创建 JSON 文件作为 profile，例如 {}。".format(
+            tccs_dir(), profile_path("example").name
+        ),
+        file=sys.stderr,
+    )
+
+
+def print_no_profile_hint() -> None:
+    active = get_active_profile()
+    profiles = list_profiles()
+    if active is None and not profiles:
+        print_create_hint()
+    elif active is None:
+        print(
+            "提示：使用 tccs -s <name> 激活一个 profile。可用 profile：{}".format(
+                ", ".join(profiles)
+            ),
+            file=sys.stderr,
+        )
+    else:
+        # active is set but profile file is missing
+        print_create_hint()
+
+
 def cmd_list() -> int:
     active = get_active_profile()
     if active is None:
         print("当前没有激活的 profile。")
+        print_no_profile_hint()
         return 0
     target = profile_path(active)
     if not target.exists():
         print("当前激活的 profile 文件不存在: {}".format(active), file=sys.stderr)
+        print_create_hint()
         return 1
     print("当前激活 profile: {}".format(active))
     data = load_profile(active)
@@ -152,6 +180,7 @@ def cmd_list_all() -> int:
     profiles = list_profiles()
     if not profiles:
         print("没有找到任何 profile。")
+        print_create_hint()
         return 0
     for name in profiles:
         marker = "* " if name == active else "  "
@@ -166,6 +195,11 @@ def cmd_switch(name: str) -> int:
     target = profile_path(name)
     if not target.exists():
         print("Profile 不存在: {}".format(name), file=sys.stderr)
+        profiles = list_profiles()
+        if profiles:
+            print("可用 profile: {}".format(", ".join(profiles)), file=sys.stderr)
+        else:
+            print_create_hint()
         return 1
     link = active_link()
     if link.exists() or link.is_symlink():
@@ -180,6 +214,7 @@ def cmd_export() -> int:
     active = get_active_profile()
     if active is None:
         print("当前没有激活的 profile。", file=sys.stderr)
+        print_no_profile_hint()
         return 1
     target = profile_path(active)
     if not target.exists():
