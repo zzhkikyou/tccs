@@ -1,2 +1,5 @@
 CLAUDE.md
 docs/
+__pycache__/
+*.pyc
+*.pyo

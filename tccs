@@ -6,36 +6,90 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
 TCCS_DIR_NAME = ".tccs"
 ACTIVE_LINK_NAME = "llm.json"
+CONFIG_FILE_NAME = "config.json"
 PROFILE_PREFIX = "llm_"
 PROFILE_SUFFIX = ".json"
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DEFAULT_CLAUDE_PATH = "~/.claude"
+CLAUDE_PATH_KEY = "claude_path"
+SYNC_ENV_KEY = "sync_env"
 
 SHELL_FILES = (".bashrc", ".bash_profile", ".zshrc")
+
+TEMPLATE_PROFILE_VARS = {
+    "ANTHROPIC_BASE_URL": "https://xxxxxx",
+    "ANTHROPIC_AUTH_TOKEN": "sk-xxxxxxx",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ANTHROPIC_MODEL": "xxxx",
+    "ANTHROPIC_SMALL_FAST_MODEL": "xxxx",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "xxxx",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "xxxx",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "xxxx",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "xxxx",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max",
+}
 
 INIT_MARKER_START = "# >>> tccs initialized >>>"
 INIT_MARKER_END = "# <<< tccs initialized <<<"
 
 INIT_FUNCTION = """{start}
 tccs-switch() {{
-    eval "$(tccs -s \"$1\")"
+    eval "$(tccs -w \"$1\")"
 }}
 tccs-refresh() {{
-    eval "$(tccs -e)"
+    local _active
+    _active=$(readlink ~/.tccs/llm.json 2>/dev/null | sed 's/^llm_//;s/\\.json$//')
+    [ -n "$_active" ] && eval "$(tccs -w "$_active")"
 }}
 
-# Auto-activate current tccs profile
+# Auto-activate tccs current profile
 if declare -f tccs-refresh &>/dev/null; then
     tccs-refresh
 fi
 {end}
 """.format(start=INIT_MARKER_START, end=INIT_MARKER_END)
 
+
+def read_json(path, default=None):
+    """Read JSON from *path*, returning *default* if missing or invalid."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return default
+    return data if isinstance(data, dict) else default
+
+
+def write_json(path, data) -> None:
+    """Write *data* as formatted JSON to *path*."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def validate_profile_data(data, name):
+    """Validate that *data* is a dict of strings; return a normalized copy."""
+    if not isinstance(data, dict):
+        raise ValueError("Profile {}: expected JSON object".format(name))
+    for k, v in data.items():
+        if not isinstance(v, str):
+            raise ValueError("Profile {}: all values must be strings".format(name))
+    return {str(k): v for k, v in data.items()}
+
+
+# ---------------------------------------------------------------------------
+# filesystem helpers
+# ---------------------------------------------------------------------------
 
 def tccs_dir() -> Path:
     return Path.home() / TCCS_DIR_NAME
@@ -53,9 +107,110 @@ def ensure_tccs_dir() -> None:
         d.chmod(0o700)
 
 
+def config_file() -> Path:
+    return tccs_dir() / CONFIG_FILE_NAME
+
+
 def profile_path(name: str) -> Path:
     return tccs_dir() / "{}{}{}".format(PROFILE_PREFIX, name, PROFILE_SUFFIX)
 
+
+# ---------------------------------------------------------------------------
+# config persistence (~/.tccs/config.json)
+# ---------------------------------------------------------------------------
+
+def load_config() -> Dict:
+    """Load tccs config, return empty dict if missing or invalid."""
+    return read_json(config_file(), default={})
+
+
+def save_config(config: Dict) -> None:
+    """Persist tccs config to disk."""
+    ensure_tccs_dir()
+    write_json(config_file(), config)
+
+
+def config_get(key: str, default=None):
+    """Return *key* from tccs config, or *default* if absent/invalid."""
+    return load_config().get(key, default)
+
+
+def config_set(key: str, value) -> None:
+    """Persist *value* under *key* in tccs config."""
+    config = load_config()
+    config[key] = value
+    save_config(config)
+
+
+def get_claude_path() -> str:
+    """Return the configured .claude directory path, default ~/.claude."""
+    return config_get(CLAUDE_PATH_KEY, str(Path(DEFAULT_CLAUDE_PATH).expanduser()))
+
+
+def set_claude_path(path: str) -> str:
+    """Set the .claude directory path in config. Returns the expanded path."""
+    expanded = str(Path(path).expanduser())
+    config_set(CLAUDE_PATH_KEY, expanded)
+    return expanded
+
+
+def settings_json_path() -> Path:
+    """Return the path to Claude Code's settings.json."""
+    return Path(get_claude_path()) / "settings.json"
+
+
+def get_sync_env() -> bool:
+    """Return whether to sync profile env to settings.json (default True)."""
+    return config_get(SYNC_ENV_KEY, True)
+
+
+def set_sync_env(value: bool) -> None:
+    """Persist the sync_env preference."""
+    config_set(SYNC_ENV_KEY, value)
+
+
+def clear_settings_env() -> bool:
+    """Clear the 'env' key in <claude_path>/settings.json.
+    Returns True if the file was modified, False if no-op or file missing."""
+    settings = read_json(settings_json_path(), default={})
+    if not settings:
+        return False
+    if "env" not in settings or settings.get("env") == {}:
+        return False
+    settings["env"] = {}
+    write_json(settings_json_path(), settings)
+    return True
+
+
+def write_settings_env(data: Dict[str, str]) -> bool:
+    """Write *data* into <claude_path>/settings.json under the 'env' key.
+    Preserves all other settings. Returns True if the file was modified."""
+    settings_path = settings_json_path()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = read_json(settings_path, default={})
+    if not isinstance(settings, dict):
+        settings = {}
+    old_env = settings.get("env", {})
+    if old_env == data:
+        return False
+    settings["env"] = data
+
+    tmp_path = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    try:
+        write_json(tmp_path, settings)
+        os.replace(str(tmp_path), str(settings_path))
+    finally:
+        if tmp_path.exists():
+            try:
+                os.unlink(str(tmp_path))
+            except OSError:
+                pass
+    return True
+
+
+# ---------------------------------------------------------------------------
+# profile management
+# ---------------------------------------------------------------------------
 
 def list_profiles() -> List[str]:
     d = tccs_dir()
@@ -82,20 +237,26 @@ def get_active_profile() -> Optional[str]:
 
 def load_profile(name: str) -> Dict[str, str]:
     p = profile_path(name)
-    with open(p, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError("Profile {}: expected JSON object".format(name))
-    for k, v in data.items():
-        if not isinstance(v, str):
-            raise ValueError("Profile {}: all values must be strings".format(name))
-    return {str(k): v for k, v in data.items()}
+    data = read_json(p, default=None)
+    return validate_profile_data(data, name)
 
 
 def print_exports(data: Dict[str, str]) -> None:
     for key, value in data.items():
         print('export {}={}'.format(key, shlex.quote(value)))
 
+
+def write_template_profile() -> Path:
+    """Create llm_example.json with template env vars. Returns the path."""
+    ensure_tccs_dir()
+    p = profile_path("example")
+    write_json(p, TEMPLATE_PROFILE_VARS)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# shell integration helpers
+# ---------------------------------------------------------------------------
 
 def shell_config_candidates() -> List[Path]:
     home = Path.home()
@@ -109,41 +270,116 @@ def find_initialized_shell_config() -> Optional[Path]:
     return None
 
 
-def cmd_init(force: bool = False) -> int:
+def remove_shell_block(content: str) -> str:
+    """Remove an existing tccs shell integration block from *content*."""
+    return re.sub(
+        r"\n?" + re.escape(INIT_MARKER_START) + r".*?" + re.escape(INIT_MARKER_END),
+        "",
+        content,
+        flags=re.DOTALL,
+    )
+
+
+def inject_shell_block(content: str) -> str:
+    """Append the tccs shell integration block to *content*."""
+    if content and not content.endswith("\n"):
+        content += "\n"
+    return content + "\n" + INIT_FUNCTION + "\n"
+
+
+def is_outdated_shell_block(content: str) -> bool:
+    """Return True if *content* contains a pre-refactor shell integration block."""
+    return (
+        'tccs -s "' in content
+        or 'tccs -e"' in content
+        or "tccs -e)" in content
+    )
+
+
+def write_shell_integration(target: Path) -> None:
+    """Inject (or re-inject) the tccs shell functions into *target*."""
+    content = target.read_text(encoding="utf-8") if target.exists() else ""
+    content = remove_shell_block(content)
+    content = inject_shell_block(content)
+    target.write_text(content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# interactive setup wizard
+# ---------------------------------------------------------------------------
+
+def cmd_setup(force: bool = False) -> int:
+    """Interactive setup: ask .claude path and env-sync preference,
+    then inject shell integration."""
+
     existing = find_initialized_shell_config()
     if existing is not None and not force:
-        print("tccs-switch already exists in {}, no need to reinitialize.".format(existing))
-        print("Use tccs -r to force reinitialization.")
+        # Check for stale shell integration (old flag references)
+        content = existing.read_text(encoding="utf-8")
+        if is_outdated_shell_block(content):
+            print("tccs shell integration is outdated.", file=sys.stderr)
+            print("Run tccs -r to update, then: source {}".format(existing), file=sys.stderr)
+            return 1
+        print("tccs already initialized ({}).".format(existing))
+        print("Run tccs -r to reinitialize.")
+        print()
+        print("Tip: to activate in the current shell, run:")
+        print("    source {}".format(existing))
         return 0
 
+    # ---- question 1: .claude path ----
+    current_claude = get_claude_path()
+    ans = input("Set .claude path [{}]: ".format(current_claude)).strip()
+    if ans:
+        set_claude_path(ans)
+        print("  -> Set to {}".format(get_claude_path()))
+    else:
+        # persist the default
+        if CLAUDE_PATH_KEY not in load_config():
+            set_claude_path(current_claude)
+
+    # ---- question 2: sync env ----
+    current_sync = get_sync_env()
+    default_hint = "Y/n" if current_sync else "y/N"
+    ans = input("Sync profile env to Claude Code settings.json? [{}]: ".format(default_hint)).strip().lower()
+    if ans in ("y", "yes"):
+        set_sync_env(True)
+        print("  -> Enabled: profile env will be synced to settings.json on switch")
+    elif ans in ("n", "no"):
+        set_sync_env(False)
+        print("  -> Disabled: settings.json will not be modified")
+    else:
+        # empty input -> keep current default
+        if SYNC_ENV_KEY not in load_config():
+            set_sync_env(current_sync)
+
+    # ---- inject shell functions ----
     candidates = shell_config_candidates()
     existing_files = [p for p in candidates if p.exists()]
     target = existing_files[0] if existing_files else candidates[0]
 
-    content = target.read_text(encoding="utf-8") if target.exists() else ""
-    # If old init block exists, remove it first
-    if INIT_MARKER_START in content and force:
-        content = re.sub(
-            r"\n?" + re.escape(INIT_MARKER_START) + r".*?" + re.escape(INIT_MARKER_END),
-            "",
-            content,
-            flags=re.DOTALL,
-        )
-        print("Removed old tccs init block.", file=sys.stderr)
-    if content and not content.endswith("\n"):
-        content += "\n"
-    content += "\n" + INIT_FUNCTION + "\n"
-    target.write_text(content, encoding="utf-8")
-    print("Written to {}. Please run:".format(target))
+    write_shell_integration(target)
+    print("Written to {}. Run:".format(target))
     print("    source {}".format(target))
-    print("After that, you can use tccs-switch <profile>.")
-    print("tccs-refresh and auto-activation configured; current profile will be auto-applied on bash start.")
+
+    tmpl = write_template_profile()
+    print()
+    print("Generated profile template: {}".format(tmpl))
+    print("Rename it and fill in your own API keys, e.g.:")
+    print("    cp {} {}".format(tmpl.name, profile_path("my_llm").name))
+    print("    # edit {name}, fill in real values".format(name=profile_path("my_llm").name))
+    print("Then use: tccs-switch my_llm")
+
     return 0
 
 
+# ---------------------------------------------------------------------------
+# sub-commands (-l, -s, -w, -a, -d, -e)
+# ---------------------------------------------------------------------------
+
 def print_create_hint() -> None:
     print(
-        "Hint: create JSON files under {} as profiles, e.g. {}.".format(
+        "Tip: create a JSON file under {} as a profile, e.g. {}.".format(
             tccs_dir(), profile_path("example").name
         ),
         file=sys.stderr,
@@ -157,17 +393,40 @@ def print_no_profile_hint() -> None:
         print_create_hint()
     elif active is None:
         print(
-            "Hint: use tccs -s <name> to activate a profile. Available profiles: {}".format(
+            "Tip: activate a profile with tccs -w <name>. Available: {}".format(
                 ", ".join(profiles)
             ),
             file=sys.stderr,
         )
     else:
-        # active is set but profile file is missing
         print_create_hint()
 
 
+def profile_name_ok(name: str) -> bool:
+    """Return True if *name* is a valid profile name; otherwise print an error."""
+    if not PROFILE_NAME_RE.fullmatch(name):
+        print("Invalid profile name: {}".format(name), file=sys.stderr)
+        return False
+    return True
+
+
+def require_profile(name: str) -> Optional[Path]:
+    """Return the path for *name* if it exists; otherwise print a hint and return None."""
+    target = profile_path(name)
+    if target.exists():
+        return target
+    print("Profile not found: {}".format(name), file=sys.stderr)
+    profiles = list_profiles()
+    if profiles:
+        print("Available: {}".format(", ".join(profiles)), file=sys.stderr)
+    else:
+        print_create_hint()
+    return None
+
+
 def cmd_list() -> int:
+    print("Claude path: {}".format(get_claude_path()))
+    print("Sync to settings.json: {}".format("Yes" if get_sync_env() else "No"))
     active = get_active_profile()
     if active is None:
         print("No active profile.")
@@ -185,7 +444,7 @@ def cmd_list() -> int:
     return 0
 
 
-def cmd_list_all() -> int:
+def cmd_show() -> int:
     active = get_active_profile()
     profiles = list_profiles()
     if not profiles:
@@ -199,85 +458,274 @@ def cmd_list_all() -> int:
 
 
 def cmd_switch(name: str) -> int:
-    if not PROFILE_NAME_RE.fullmatch(name):
-        print("Invalid profile name: {}".format(name), file=sys.stderr)
+    if not profile_name_ok(name):
         return 1
-    target = profile_path(name)
-    if not target.exists():
-        print("Profile not found: {}".format(name), file=sys.stderr)
-        profiles = list_profiles()
-        if profiles:
-            print("Available profiles: {}".format(", ".join(profiles)), file=sys.stderr)
-        else:
-            print_create_hint()
+    target = require_profile(name)
+    if target is None:
         return 1
     link = active_link()
     if link.exists() or link.is_symlink():
         link.unlink()
     link.symlink_to(target.name)
     data = load_profile(name)
+
+    if get_sync_env():
+        if write_settings_env(data):
+            print("Synced env to {}.".format(settings_json_path()), file=sys.stderr)
+
     print_exports(data)
+    if sys.stdout.isatty():
+        print("", file=sys.stderr)
+        print("Tip: export statements above do NOT affect the current shell.", file=sys.stderr)
+        print("Use tccs-switch {} or eval \"$(tccs -w {})\" to apply.".format(name, name), file=sys.stderr)
     return 0
 
 
 def cmd_delete(name: str) -> int:
-    if not PROFILE_NAME_RE.fullmatch(name):
-        print("Invalid profile name: {}".format(name), file=sys.stderr)
+    if not profile_name_ok(name):
         return 1
-    target = profile_path(name)
-    if not target.exists():
-        print("Profile not found: {}".format(name), file=sys.stderr)
-        profiles = list_profiles()
-        if profiles:
-            print("Available profiles: {}".format(", ".join(profiles)), file=sys.stderr)
-        else:
-            print_create_hint()
+    if name == "example":
+        print("Cannot delete the example profile.", file=sys.stderr)
         return 1
-    # If deleting the active profile, clean up the symlink too
+    target = require_profile(name)
+    if target is None:
+        return 1
     active = get_active_profile()
     if active == name:
+        print("Warning: deleting the currently active profile.", file=sys.stderr)
         link = active_link()
         if link.is_symlink():
             link.unlink()
         print("Deactivated.", file=sys.stderr)
+        if get_sync_env():
+            if clear_settings_env():
+                print("Cleared env in {}.".format(settings_json_path()), file=sys.stderr)
     target.unlink()
     print("Deleted profile: {}".format(name))
     return 0
 
 
-def cmd_export() -> int:
-    active = get_active_profile()
-    if active is None:
-        print("No active profile.", file=sys.stderr)
-        print_no_profile_hint()
-        return 1
-    target = profile_path(active)
-    if not target.exists():
-        print("Active profile file not found: {}".format(active), file=sys.stderr)
-        return 1
-    data = load_profile(active)
-    print_exports(data)
-    if sys.stdout.isatty():
+def edit_in_editor(initial_content: str) -> Optional[str]:
+    """Open $EDITOR on a temp file seeded with *initial_content* and return the edited text.
+    Returns None if the editor cannot be found or the temp file cannot be read."""
+    editor = os.environ.get("EDITOR", "")
+    if not editor:
+        # Fallback: try vim first, then vi
+        for candidate in ("vim", "vi"):
+            try:
+                subprocess.check_call(
+                    ["which", candidate],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                editor = candidate
+                break
+            except subprocess.CalledProcessError:
+                continue
+    if not editor:
+        editor = "vi"  # last resort
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="tccs_", delete=False, encoding="utf-8"
+        ) as tmpf:
+            tmpf.write(initial_content)
+            tmpf.flush()
+            tmp_path = tmpf.name
+
+        try:
+            subprocess.call([editor, tmp_path])
+        except FileNotFoundError:
+            print("Editor '{}' not found.".format(editor), file=sys.stderr)
+            return None
+
+        try:
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            print("Failed to read edited file: {}".format(e), file=sys.stderr)
+            return None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def cmd_add() -> int:
+    """Interactive: prompt for profile name, open editor with template, save, ask switch."""
+    # 1. Prompt for name
+    try:
+        name = input("Profile name: ").strip()
+    except (EOFError, KeyboardInterrupt):
         print("", file=sys.stderr)
-        print("Hint: run the following to apply environment variables immediately:", file=sys.stderr)
-        print("    eval \"$(tccs -e)\"", file=sys.stderr)
-        print("If already initialized, you can also run:", file=sys.stderr)
-        print("    tccs-refresh", file=sys.stderr)
+        return 1
+    if not name:
+        print("No name given.", file=sys.stderr)
+        return 1
+
+    # 2. Validate name
+    if not profile_name_ok(name):
+        print("Use only letters, digits, underscores, and hyphens.", file=sys.stderr)
+        return 1
+
+    # 3. Duplicate check
+    target = profile_path(name)
+    if target.exists():
+        print("Profile already exists: {}".format(name), file=sys.stderr)
+        return 1
+
+    # 4. Ensure example template exists
+    example_path = profile_path("example")
+    if not example_path.exists():
+        write_template_profile()
+
+    # 5. Read template content
+    with open(example_path, "r", encoding="utf-8") as f:
+        template_content = f.read()
+
+    # 6-7. Open editor and read edited content
+    edited = edit_in_editor(template_content)
+    if edited is None:
+        return 1
+
+    # 8. Validate JSON
+    try:
+        data = json.loads(edited)
+    except json.JSONDecodeError as e:
+        print("Invalid JSON: {}".format(e), file=sys.stderr)
+        print("Profile not saved. You can retry with tccs -a.", file=sys.stderr)
+        return 1
+
+    try:
+        validate_profile_data(data, name)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    # 9. Save profile
+    ensure_tccs_dir()
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(edited)
+    print("Saved profile: {}".format(target), file=sys.stderr)
+
+    # 10. Ask if switch
+    try:
+        ans = input("Switch to {}? [Y/n]: ".format(name)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("", file=sys.stderr)
+        return 0
+
+    if ans in ("", "y", "yes"):
+        return cmd_switch(name)
+
     return 0
 
 
+def cmd_edit(name: str) -> int:
+    """Interactive: select profile, open editor, save, remind to tccs-refresh."""
+    # 1. If no name given, list profiles and prompt for selection
+    if not name:
+        profiles = list_profiles()
+        if not profiles:
+            print("No profiles found.", file=sys.stderr)
+            print_create_hint()
+            return 1
+        print("Available profiles:")
+        for p in profiles:
+            print("  {}".format(p))
+        try:
+            name = input("Profile to edit: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("", file=sys.stderr)
+            return 1
+        if not name:
+            print("No name given.", file=sys.stderr)
+            return 1
+
+    # 2. Validate name
+    if not profile_name_ok(name):
+        return 1
+
+    # 3. Check profile exists
+    target = require_profile(name)
+    if target is None:
+        return 1
+
+    # 4. Read current content
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            current_content = f.read()
+    except OSError as e:
+        print("Failed to read profile: {}".format(e), file=sys.stderr)
+        return 1
+
+    # 5-6. Open editor and read edited content
+    edited = edit_in_editor(current_content)
+    if edited is None:
+        return 1
+
+    # 7. Validate JSON
+    try:
+        data = json.loads(edited)
+    except json.JSONDecodeError as e:
+        print("Invalid JSON: {}".format(e), file=sys.stderr)
+        print("Profile not saved. You can retry with tccs -e.", file=sys.stderr)
+        return 1
+
+    try:
+        validate_profile_data(data, name)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    # 8. Save
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(edited)
+    print("Saved profile: {}".format(target), file=sys.stderr)
+
+    # 9. Sync to settings.json if active and sync_env enabled
+    active = get_active_profile()
+    if active == name and get_sync_env():
+        data = load_profile(name)
+        if write_settings_env(data):
+            print("Synced env to {}.".format(settings_json_path()), file=sys.stderr)
+
+    # 10. Remind to refresh
+    if active == name:
+        print("Profile is active. Run: tccs-refresh", file=sys.stderr)
+    else:
+        print("Profile edited. Switch to it with: tccs-switch {}".format(name), file=sys.stderr)
+        print("Or if already active elsewhere, run: tccs-refresh", file=sys.stderr)
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 EPILOG = """\
 Usage:
-  Add profile       Create a JSON file under {dir}, e.g. {example}.
-                    File content as flat key-value pairs: {{"KEY": "value", ...}}
-  Delete profile    tccs -d <name>
-  List profiles     tccs -a
-  Switch profile    tccs -s <name>          (or eval "$(tccs -s <name>)" to apply immediately)
-  Show current      tccs -l
-  Export env vars   tccs -e                 (or eval "$(tccs -e)")
-  Init shell        tccs                   (first-time setup)
-  Reinitialize      tccs -r                (update shell functions or fix issues)""".format(
-    dir=tccs_dir(), example=profile_path("example").name
+  tccs               interactive setup
+  tccs -r            re-run setup
+  tccs -s (--show)   list all profiles
+  tccs -l            show active profile and env vars
+  tccs -w <name>     switch profile (prints export statements)
+  tccs -a (--add)    add a new profile interactively
+  tccs -e [<name>]   edit a profile interactively
+  tccs -d <name>     delete a profile
+
+Shell functions (available after setup):
+  tccs-switch <name>     switch profile, takes effect immediately
+  tccs-refresh           reload current profile
+
+Note: tccs -w only prints exports; it does NOT change the current shell.
+      Use tccs-switch or eval "$(tccs -w <name>)" to apply.
+
+Profile files: JSON files under {dir} (e.g. {example}), with {{"KEY": "value"}} pairs.""".format(
+    dir=tccs_dir(), example=profile_path("example").name,
 )
 
 
@@ -288,34 +736,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-l", action="store_true", help="Show active profile")
-    parser.add_argument("-a", action="store_true", help="List all profiles")
-    parser.add_argument("-s", metavar="NAME", help="Switch to profile and output export statements")
-    parser.add_argument("-d", metavar="NAME", help="Delete a profile")
-    parser.add_argument("-e", "--export", action="store_true", help="Output export statements for active profile")
-    parser.add_argument("-r", "--reinit", action="store_true", help="Force reinitialize shell integration")
+    parser.add_argument("-r", action="store_true", help="force re-run interactive setup")
+    parser.add_argument("-l", action="store_true", help="show active profile")
+    parser.add_argument("-s", "--show", action="store_true", help="list all profiles")
+    parser.add_argument("-a", "--add", action="store_true", help="add a new profile interactively")
+    parser.add_argument("-w", metavar="NAME", help="switch to profile, print export statements")
+    parser.add_argument("-d", metavar="NAME", help="delete a profile")
+    parser.add_argument("-e", "--edit", metavar="NAME", nargs="?", const="", help="edit a profile interactively")
 
     args = parser.parse_args(argv)
 
-    if args.reinit:
-        return cmd_init(force=True)
-
-    if not (args.l or args.a or args.s is not None or args.d is not None or args.export):
-        return cmd_init()
+    has_command = any(
+        [args.l, args.show, args.add, args.w is not None, args.d is not None, args.edit is not None]
+    )
+    if not has_command:
+        return cmd_setup(force=args.r)
 
     ensure_tccs_dir()
 
     try:
         if args.l:
             return cmd_list()
-        if args.a:
-            return cmd_list_all()
-        if args.s is not None:
-            return cmd_switch(args.s)
+        if args.show:
+            return cmd_show()
+        if args.add:
+            return cmd_add()
+        if args.w is not None:
+            return cmd_switch(args.w)
         if args.d is not None:
             return cmd_delete(args.d)
-        if args.export:
-            return cmd_export()
+        if args.edit is not None:
+            return cmd_edit(args.edit)
     except (ValueError, FileNotFoundError) as e:
         print("Error: {}".format(e), file=sys.stderr)
         return 1
@@ -325,4 +776,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
