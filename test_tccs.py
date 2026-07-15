@@ -139,8 +139,9 @@ class TestSetup(unittest.TestCase):
             content = bashrc.read_text()
             self.assertIn("tccs-switch", content)
             self.assertIn("tccs-refresh", content)
-            self.assertIn("# >>> tccs initialized >>>", content)
-            self.assertIn("# <<< tccs initialized <<<", content)
+            self.assertIn("# >>> tccs initialized v2 >>>", content)
+            self.assertIn("# <<< tccs initialized v2 <<<", content)
+            self.assertIn("tccs-env()", content)
             self.assertTrue((Path(home) / ".tccs" / "llm_example.json").exists())
         finally:
             shutil.rmtree(home)
@@ -463,6 +464,105 @@ class TestSettingsJsonSync(unittest.TestCase):
 
             data = json.loads(settings.read_text())
             self.assertEqual(data["env"], {"OLD": "val"})
+        finally:
+            shutil.rmtree(home)
+
+
+class TestEnv(unittest.TestCase):
+    def _create_profile(self, home, name, data):
+        """Create a profile file under the temp HOME."""
+        tccs_dir = Path(home) / ".tccs"
+        tccs_dir.mkdir(mode=0o700, exist_ok=True)
+        (tccs_dir / "llm_{}.json".format(name)).write_text(json.dumps(data) + "\n")
+
+    def test_env_prints_exports(self):
+        """tccs -E prints export statements for the profile."""
+        home = tempfile.mkdtemp()
+        try:
+            self._create_profile(home, "foo", {"API": "secret", "URL": "http://x"})
+            result = run_tccs(["-E", "foo"], home)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("export API=secret", result.stdout)
+            self.assertIn("export URL=http://x", result.stdout)
+        finally:
+            shutil.rmtree(home)
+
+    def test_env_invalid_name(self):
+        """tccs -E rejects invalid profile names."""
+        home = tempfile.mkdtemp()
+        try:
+            result = run_tccs(["-E", "bad name!"], home)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Invalid profile name", result.stderr)
+        finally:
+            shutil.rmtree(home)
+
+    def test_env_profile_not_found(self):
+        """tccs -E reports missing profiles."""
+        home = tempfile.mkdtemp()
+        try:
+            result = run_tccs(["-E", "missing"], home)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Profile not found", result.stderr)
+        finally:
+            shutil.rmtree(home)
+
+    def test_env_does_not_update_symlink(self):
+        """tccs -E does not create or change the active symlink."""
+        home = tempfile.mkdtemp()
+        try:
+            self._create_profile(home, "foo", {"A": "1"})
+            self._create_profile(home, "bar", {"B": "2"})
+            tccs_dir = Path(home) / ".tccs"
+            # Set active to foo first via -w
+            run_tccs(["-w", "foo"], home)
+            # Now env-source bar - should not change symlink
+            result = run_tccs(["-E", "bar"], home)
+            self.assertEqual(result.returncode, 0)
+            link = tccs_dir / "llm.json"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(str(link)), "llm_foo.json")
+        finally:
+            shutil.rmtree(home)
+
+    def test_env_does_not_create_symlink(self):
+        """tccs -E does not create an active symlink if none exists."""
+        home = tempfile.mkdtemp()
+        try:
+            self._create_profile(home, "foo", {"A": "1"})
+            result = run_tccs(["-E", "foo"], home)
+            self.assertEqual(result.returncode, 0)
+            link = Path(home) / ".tccs" / "llm.json"
+            self.assertFalse(link.exists())
+        finally:
+            shutil.rmtree(home)
+
+    def test_env_does_not_touch_settings_json(self):
+        """tccs -E leaves settings.json alone even when sync_env=True."""
+        home = tempfile.mkdtemp()
+        try:
+            self._create_profile(home, "foo", {"API": "secret"})
+            claude_dir = Path(home) / ".claude"
+            claude_dir.mkdir()
+            settings = claude_dir / "settings.json"
+            settings.write_text('{"env": {"OLD": "val"}, "other": 1}\n')
+            result = run_tccs(["-E", "foo"], home)
+            self.assertEqual(result.returncode, 0)
+            data = json.loads(settings.read_text())
+            self.assertEqual(data["env"], {"OLD": "val"})
+            self.assertEqual(data["other"], 1)
+        finally:
+            shutil.rmtree(home)
+
+    def test_env_does_not_create_settings_json(self):
+        """tccs -E does not create settings.json if it doesn't exist."""
+        home = tempfile.mkdtemp()
+        try:
+            self._create_profile(home, "foo", {"API": "secret"})
+            result = run_tccs(["-E", "foo"], home)
+            self.assertEqual(result.returncode, 0)
+            settings = Path(home) / ".claude" / "settings.json"
+            self.assertFalse(settings.exists())
         finally:
             shutil.rmtree(home)
 

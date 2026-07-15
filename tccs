@@ -39,8 +39,8 @@ TEMPLATE_PROFILE_VARS = {
     "CLAUDE_CODE_EFFORT_LEVEL": "max",
 }
 
-INIT_MARKER_START = "# >>> tccs initialized >>>"
-INIT_MARKER_END = "# <<< tccs initialized <<<"
+INIT_MARKER_START = "# >>> tccs initialized v2 >>>"
+INIT_MARKER_END = "# <<< tccs initialized v2 <<<"
 
 INIT_FUNCTION = """{start}
 tccs-switch() {{
@@ -50,6 +50,9 @@ tccs-refresh() {{
     local _active
     _active=$(readlink ~/.tccs/llm.json 2>/dev/null | sed 's/^llm_//;s/\\.json$//')
     [ -n "$_active" ] && eval "$(tccs -w "$_active")"
+}}
+tccs-env() {{
+    eval "$(tccs -E \"$1\")"
 }}
 
 # Auto-activate tccs current profile
@@ -263,17 +266,21 @@ def shell_config_candidates() -> List[Path]:
     return [home / f for f in SHELL_FILES]
 
 
+_MARKER_PREFIX = "# >>> tccs initialized"
+
+
 def find_initialized_shell_config() -> Optional[Path]:
     for p in shell_config_candidates():
-        if p.exists() and INIT_MARKER_START in p.read_text(encoding="utf-8"):
+        if p.exists() and _MARKER_PREFIX in p.read_text(encoding="utf-8"):
             return p
     return None
 
 
 def remove_shell_block(content: str) -> str:
-    """Remove an existing tccs shell integration block from *content*."""
+    """Remove an existing tccs shell integration block from *content*.
+    Handles both v2 and older (unversioned) blocks."""
     return re.sub(
-        r"\n?" + re.escape(INIT_MARKER_START) + r".*?" + re.escape(INIT_MARKER_END),
+        r"\n?# >>> tccs initialized.*?>>>\n.*?# <<< tccs initialized.*?<<<\n?",
         "",
         content,
         flags=re.DOTALL,
@@ -288,11 +295,9 @@ def inject_shell_block(content: str) -> str:
 
 
 def is_outdated_shell_block(content: str) -> bool:
-    """Return True if *content* contains a pre-refactor shell integration block."""
+    """Return True if *content* contains a pre-v2 shell integration block."""
     return (
-        'tccs -s "' in content
-        or 'tccs -e"' in content
-        or "tccs -e)" in content
+        INIT_MARKER_START not in content
     )
 
 
@@ -424,6 +429,18 @@ def require_profile(name: str) -> Optional[Path]:
     return None
 
 
+def _load_profile(name: str) -> Optional[Dict[str, str]]:
+    """Validate *name*, verify the profile exists, load and return profile data.
+    Returns None on failure (error already printed). Does NOT print exports;
+    callers decide when to emit them."""
+    if not profile_name_ok(name):
+        return None
+    target = require_profile(name)
+    if target is None:
+        return None
+    return load_profile(name)
+
+
 def cmd_list() -> int:
     print("Claude path: {}".format(get_claude_path()))
     print("Sync to settings.json: {}".format("Yes" if get_sync_env() else "No"))
@@ -458,16 +475,13 @@ def cmd_show() -> int:
 
 
 def cmd_switch(name: str) -> int:
-    if not profile_name_ok(name):
-        return 1
-    target = require_profile(name)
-    if target is None:
+    data = _load_profile(name)
+    if data is None:
         return 1
     link = active_link()
     if link.exists() or link.is_symlink():
         link.unlink()
-    link.symlink_to(target.name)
-    data = load_profile(name)
+    link.symlink_to(profile_path(name).name)
 
     if get_sync_env():
         if write_settings_env(data):
@@ -478,6 +492,15 @@ def cmd_switch(name: str) -> int:
         print("", file=sys.stderr)
         print("Tip: export statements above do NOT affect the current shell.", file=sys.stderr)
         print("Use tccs-switch {} or eval \"$(tccs -w {})\" to apply.".format(name, name), file=sys.stderr)
+    return 0
+
+
+def cmd_env(name: str) -> int:
+    """Source env vars from a profile without touching any config files."""
+    data = _load_profile(name)
+    if data is None:
+        return 1
+    print_exports(data)
     return 0
 
 
@@ -713,6 +736,7 @@ Usage:
   tccs -s (--show)   list all profiles
   tccs -l            show active profile and env vars
   tccs -w <name>     switch profile (prints export statements)
+  tccs -E <name>     source env from profile without touching config files
   tccs -a (--add)    add a new profile interactively
   tccs -e [<name>]   edit a profile interactively
   tccs -d <name>     delete a profile
@@ -720,6 +744,7 @@ Usage:
 Shell functions (available after setup):
   tccs-switch <name>     switch profile, takes effect immediately
   tccs-refresh           reload current profile
+  tccs-env <name>        source env from profile (transient, no config changes)
 
 Note: tccs -w only prints exports; it does NOT change the current shell.
       Use tccs-switch or eval "$(tccs -w <name>)" to apply.
@@ -743,11 +768,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("-w", metavar="NAME", help="switch to profile, print export statements")
     parser.add_argument("-d", metavar="NAME", help="delete a profile")
     parser.add_argument("-e", "--edit", metavar="NAME", nargs="?", const="", help="edit a profile interactively")
+    parser.add_argument("-E", metavar="NAME", help="source env from profile without touching config files")
 
     args = parser.parse_args(argv)
 
     has_command = any(
-        [args.l, args.show, args.add, args.w is not None, args.d is not None, args.edit is not None]
+        [args.l, args.show, args.add, args.w is not None, args.d is not None, args.edit is not None,
+         args.E is not None]
     )
     if not has_command:
         return cmd_setup(force=args.r)
@@ -767,6 +794,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_delete(args.d)
         if args.edit is not None:
             return cmd_edit(args.edit)
+        if args.E is not None:
+            return cmd_env(args.E)
     except (ValueError, FileNotFoundError) as e:
         print("Error: {}".format(e), file=sys.stderr)
         return 1
