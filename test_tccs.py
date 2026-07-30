@@ -189,15 +189,55 @@ class TestConfig(unittest.TestCase):
         try:
             tccs_dir = Path(home) / ".tccs"
             tccs_dir.mkdir(mode=0o700)
+            # Use a path that actually exists so the fallback is not triggered.
+            custom_claude = Path(home) / "custom" / ".claude"
+            custom_claude.mkdir(parents=True)
             config = {
-                "claude_path": "/custom/.claude",
+                "claude_path": str(custom_claude),
                 "sync_env": False,
             }
             (tccs_dir / "config.json").write_text(json.dumps(config) + "\n")
             result = run_tccs(["-l"], home)
             self.assertEqual(result.returncode, 0)
-            self.assertIn("Claude path: /custom/.claude", result.stdout)
+            self.assertIn("Claude path: {}".format(custom_claude), result.stdout)
             self.assertIn("Sync to settings.json: No", result.stdout)
+        finally:
+            shutil.rmtree(home)
+
+    def test_get_claude_path_fallback(self):
+        """get_claude_path falls back to ~/.claude when configured path is missing."""
+        home = tempfile.mkdtemp()
+        try:
+            # Create ~/.claude so the fallback has somewhere to land.
+            default_claude = Path(home) / ".claude"
+            default_claude.mkdir(parents=True)
+
+            tccs_dir = Path(home) / ".tccs"
+            tccs_dir.mkdir(mode=0o700)
+            config = {"claude_path": "/nonexistent/path/.claude"}
+            (tccs_dir / "config.json").write_text(json.dumps(config) + "\n")
+            result = run_tccs(["-l"], home)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn(
+                "Warning: configured claude_path '/nonexistent/path/.claude' not found",
+                result.stderr,
+            )
+            self.assertIn(
+                "Claude path: {}".format(default_claude), result.stdout,
+            )
+        finally:
+            shutil.rmtree(home)
+
+    def test_claude_path_stores_tilde_unexpanded(self):
+        """claude_path is stored with ~ as-is for cross-machine portability."""
+        home = tempfile.mkdtemp()
+        try:
+            result = run_tccs([], home, input="~/work/.claude\nn\n")
+            self.assertEqual(result.returncode, 0)
+            config = json.loads(
+                (Path(home) / ".tccs" / "config.json").read_text()
+            )
+            self.assertEqual(config["claude_path"], "~/work/.claude")
         finally:
             shutil.rmtree(home)
 
@@ -205,10 +245,12 @@ class TestConfig(unittest.TestCase):
         """Interactive setup persists the chosen claude_path and sync_env."""
         home = tempfile.mkdtemp()
         try:
-            result = run_tccs([], home, input="/custom\nn\n")
+            custom_claude = Path(home) / "custom"
+            custom_claude.mkdir(parents=True)
+            result = run_tccs([], home, input="{}\nn\n".format(custom_claude))
             self.assertEqual(result.returncode, 0)
             result = run_tccs(["-l"], home)
-            self.assertIn("Claude path: /custom", result.stdout)
+            self.assertIn("Claude path: {}".format(custom_claude), result.stdout)
             self.assertIn("Sync to settings.json: No", result.stdout)
         finally:
             shutil.rmtree(home)

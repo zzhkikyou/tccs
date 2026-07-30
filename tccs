@@ -146,15 +146,31 @@ def config_set(key: str, value) -> None:
 
 
 def get_claude_path() -> str:
-    """Return the configured .claude directory path, default ~/.claude."""
-    return config_get(CLAUDE_PATH_KEY, str(Path(DEFAULT_CLAUDE_PATH).expanduser()))
+    """Return the configured .claude directory path, resolved at runtime.
+
+    Expands ``~`` and ``$HOME`` in the stored value so the path is always
+    relative to the *current* machine.  Falls back to ``~/.claude`` when the
+    configured path does not exist on this host.
+    """
+    raw = config_get(CLAUDE_PATH_KEY, DEFAULT_CLAUDE_PATH)
+    expanded = str(Path(raw).expanduser())
+    if Path(expanded).exists():
+        return expanded
+    fallback = str(Path(DEFAULT_CLAUDE_PATH).expanduser())
+    print(
+        "Warning: configured claude_path '{}' not found, "
+        "falling back to '{}'.".format(expanded, fallback),
+        file=sys.stderr,
+    )
+    return fallback
 
 
 def set_claude_path(path: str) -> str:
-    """Set the .claude directory path in config. Returns the expanded path."""
-    expanded = str(Path(path).expanduser())
-    config_set(CLAUDE_PATH_KEY, expanded)
-    return expanded
+    """Persist *path* as-is (without expanding ``~``) so the config stays
+    portable across machines.  Returns the runtime-resolved path for display
+    purposes."""
+    config_set(CLAUDE_PATH_KEY, path)
+    return str(Path(path).expanduser())
 
 
 def settings_json_path() -> Path:
@@ -339,9 +355,9 @@ def cmd_setup(force: bool = False) -> int:
         set_claude_path(ans)
         print("  -> Set to {}".format(get_claude_path()))
     else:
-        # persist the default
+        # persist the default in portable form (~/.claude)
         if CLAUDE_PATH_KEY not in load_config():
-            set_claude_path(current_claude)
+            set_claude_path(DEFAULT_CLAUDE_PATH)
 
     # ---- question 2: sync env ----
     current_sync = get_sync_env()
