@@ -145,7 +145,12 @@ def config_set(key: str, value) -> None:
     save_config(config)
 
 
-def get_claude_path() -> str:
+def _expand_home(path: str) -> str:
+    """Expand ``~`` and ``$HOME`` in *path* to an absolute path."""
+    return str(Path(path).expanduser())
+
+
+def resolve_claude_path() -> str:
     """Return the configured .claude directory path, resolved at runtime.
 
     Expands ``~`` and ``$HOME`` in the stored value so the path is always
@@ -153,10 +158,10 @@ def get_claude_path() -> str:
     configured path does not exist on this host.
     """
     raw = config_get(CLAUDE_PATH_KEY, DEFAULT_CLAUDE_PATH)
-    expanded = str(Path(raw).expanduser())
+    expanded = _expand_home(raw)
     if Path(expanded).exists():
         return expanded
-    fallback = str(Path(DEFAULT_CLAUDE_PATH).expanduser())
+    fallback = _expand_home(DEFAULT_CLAUDE_PATH)
     print(
         "Warning: configured claude_path '{}' not found, "
         "falling back to '{}'.".format(expanded, fallback),
@@ -165,17 +170,17 @@ def get_claude_path() -> str:
     return fallback
 
 
-def set_claude_path(path: str) -> str:
+def save_claude_path(path: str) -> str:
     """Persist *path* as-is (without expanding ``~``) so the config stays
     portable across machines.  Returns the runtime-resolved path for display
     purposes."""
     config_set(CLAUDE_PATH_KEY, path)
-    return str(Path(path).expanduser())
+    return _expand_home(path)
 
 
 def settings_json_path() -> Path:
     """Return the path to Claude Code's settings.json."""
-    return Path(get_claude_path()) / "settings.json"
+    return Path(resolve_claude_path()) / "settings.json"
 
 
 def get_sync_env() -> bool:
@@ -349,15 +354,15 @@ def cmd_setup(force: bool = False) -> int:
         return 0
 
     # ---- question 1: .claude path ----
-    current_claude = get_claude_path()
+    current_claude = resolve_claude_path()
     ans = input("Set .claude path [{}]: ".format(current_claude)).strip()
     if ans:
-        set_claude_path(ans)
-        print("  -> Set to {}".format(get_claude_path()))
+        save_claude_path(ans)
+        print("  -> Set to {}".format(resolve_claude_path()))
     else:
         # persist the default in portable form (~/.claude)
         if CLAUDE_PATH_KEY not in load_config():
-            set_claude_path(DEFAULT_CLAUDE_PATH)
+            save_claude_path(DEFAULT_CLAUDE_PATH)
 
     # ---- question 2: sync env ----
     current_sync = get_sync_env()
@@ -458,7 +463,7 @@ def _load_profile(name: str) -> Optional[Dict[str, str]]:
 
 
 def cmd_list() -> int:
-    print("Claude path: {}".format(get_claude_path()))
+    print("Claude path: {}".format(resolve_claude_path()))
     print("Sync to settings.json: {}".format("Yes" if get_sync_env() else "No"))
     active = get_active_profile()
     if active is None:
