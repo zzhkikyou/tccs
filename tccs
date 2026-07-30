@@ -14,13 +14,12 @@ from typing import Dict, List, Optional
 
 TCCS_DIR_NAME = ".tccs"
 ACTIVE_LINK_NAME = "llm.json"
-CONFIG_FILE_NAME = "config.json"
 PROFILE_PREFIX = "llm_"
 PROFILE_SUFFIX = ".json"
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 DEFAULT_CLAUDE_PATH = "~/.claude"
-CLAUDE_PATH_KEY = "claude_path"
-SYNC_ENV_KEY = "sync_env"
+ENV_CLAUDE_PATH = "TCCS_CLAUDE_PATH"
+ENV_SYNC_ENV = "TCCS_SYNC_ENV"
 
 SHELL_FILES = (".bashrc", ".bash_profile", ".zshrc")
 
@@ -39,10 +38,13 @@ TEMPLATE_PROFILE_VARS = {
     "CLAUDE_CODE_EFFORT_LEVEL": "max",
 }
 
-INIT_MARKER_START = "# >>> tccs initialized v2 >>>"
-INIT_MARKER_END = "# <<< tccs initialized v2 <<<"
+INIT_MARKER_START = "# >>> tccs initialized v3 >>>"
+INIT_MARKER_END = "# <<< tccs initialized v3 <<<"
 
 INIT_FUNCTION = """{start}
+export TCCS_CLAUDE_PATH="__CLAUDE_PATH__"
+export TCCS_SYNC_ENV="__SYNC_ENV__"
+
 tccs-switch() {{
     eval "$(tccs -w \"$1\")"
 }}
@@ -110,40 +112,13 @@ def ensure_tccs_dir() -> None:
         d.chmod(0o700)
 
 
-def config_file() -> Path:
-    return tccs_dir() / CONFIG_FILE_NAME
-
-
 def profile_path(name: str) -> Path:
     return tccs_dir() / "{}{}{}".format(PROFILE_PREFIX, name, PROFILE_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
-# config persistence (~/.tccs/config.json)
+# claude path & sync-env helpers
 # ---------------------------------------------------------------------------
-
-def load_config() -> Dict:
-    """Load tccs config, return empty dict if missing or invalid."""
-    return read_json(config_file(), default={})
-
-
-def save_config(config: Dict) -> None:
-    """Persist tccs config to disk."""
-    ensure_tccs_dir()
-    write_json(config_file(), config)
-
-
-def config_get(key: str, default=None):
-    """Return *key* from tccs config, or *default* if absent/invalid."""
-    return load_config().get(key, default)
-
-
-def config_set(key: str, value) -> None:
-    """Persist *value* under *key* in tccs config."""
-    config = load_config()
-    config[key] = value
-    save_config(config)
-
 
 def _expand_home(path: str) -> str:
     """Expand ``~`` and ``$HOME`` in *path* to an absolute path."""
@@ -153,11 +128,12 @@ def _expand_home(path: str) -> str:
 def resolve_claude_path() -> str:
     """Return the configured .claude directory path, resolved at runtime.
 
-    Expands ``~`` and ``$HOME`` in the stored value so the path is always
+    Reads ``TCCS_CLAUDE_PATH`` from the environment (set by the shell
+    integration block).  Expands ``~`` and ``$HOME`` so the path is always
     relative to the *current* machine.  Falls back to ``~/.claude`` when the
     configured path does not exist on this host.
     """
-    raw = config_get(CLAUDE_PATH_KEY, DEFAULT_CLAUDE_PATH)
+    raw = os.environ.get(ENV_CLAUDE_PATH, DEFAULT_CLAUDE_PATH)
     expanded = _expand_home(raw)
     if Path(expanded).exists():
         return expanded
@@ -170,27 +146,18 @@ def resolve_claude_path() -> str:
     return fallback
 
 
-def save_claude_path(path: str) -> str:
-    """Persist *path* as-is (without expanding ``~``) so the config stays
-    portable across machines.  Returns the runtime-resolved path for display
-    purposes."""
-    config_set(CLAUDE_PATH_KEY, path)
-    return _expand_home(path)
-
-
 def settings_json_path() -> Path:
     """Return the path to Claude Code's settings.json."""
     return Path(resolve_claude_path()) / "settings.json"
 
 
 def get_sync_env() -> bool:
-    """Return whether to sync profile env to settings.json (default True)."""
-    return config_get(SYNC_ENV_KEY, True)
+    """Return whether to sync profile env to settings.json (default True).
 
-
-def set_sync_env(value: bool) -> None:
-    """Persist the sync_env preference."""
-    config_set(SYNC_ENV_KEY, value)
+    Reads ``TCCS_SYNC_ENV`` from the environment (set by the shell
+    integration block).
+    """
+    return os.environ.get(ENV_SYNC_ENV, "true").lower() in ("true", "1", "yes")
 
 
 def clear_settings_env() -> bool:
@@ -308,25 +275,29 @@ def remove_shell_block(content: str) -> str:
     )
 
 
-def inject_shell_block(content: str) -> str:
+def inject_shell_block(content: str, claude_path: str, sync_env: bool) -> str:
     """Append the tccs shell integration block to *content*."""
     if content and not content.endswith("\n"):
         content += "\n"
-    return content + "\n" + INIT_FUNCTION + "\n"
+    return content + "\n" + INIT_FUNCTION.replace(
+        "__CLAUDE_PATH__", claude_path,
+    ).replace(
+        "__SYNC_ENV__", "true" if sync_env else "false",
+    ) + "\n"
 
 
 def is_outdated_shell_block(content: str) -> bool:
-    """Return True if *content* contains a pre-v2 shell integration block."""
+    """Return True if *content* contains a pre-v3 shell integration block."""
     return (
         INIT_MARKER_START not in content
     )
 
 
-def write_shell_integration(target: Path) -> None:
+def write_shell_integration(target: Path, claude_path: str, sync_env: bool) -> None:
     """Inject (or re-inject) the tccs shell functions into *target*."""
     content = target.read_text(encoding="utf-8") if target.exists() else ""
     content = remove_shell_block(content)
-    content = inject_shell_block(content)
+    content = inject_shell_block(content, claude_path, sync_env)
     target.write_text(content, encoding="utf-8")
 
 
@@ -354,37 +325,27 @@ def cmd_setup(force: bool = False) -> int:
         return 0
 
     # ---- question 1: .claude path ----
-    current_claude = resolve_claude_path()
-    ans = input("Set .claude path [{}]: ".format(current_claude)).strip()
-    if ans:
-        save_claude_path(ans)
-        print("  -> Set to {}".format(resolve_claude_path()))
-    else:
-        # persist the default in portable form (~/.claude)
-        if CLAUDE_PATH_KEY not in load_config():
-            save_claude_path(DEFAULT_CLAUDE_PATH)
+    current_claude_raw = os.environ.get(ENV_CLAUDE_PATH, DEFAULT_CLAUDE_PATH)
+    ans = input("Set .claude path [{}]: ".format(current_claude_raw)).strip()
+    claude_path = ans if ans else current_claude_raw
 
     # ---- question 2: sync env ----
     current_sync = get_sync_env()
     default_hint = "Y/n" if current_sync else "y/N"
     ans = input("Sync profile env to Claude Code settings.json? [{}]: ".format(default_hint)).strip().lower()
     if ans in ("y", "yes"):
-        set_sync_env(True)
-        print("  -> Enabled: profile env will be synced to settings.json on switch")
+        sync_env = True
     elif ans in ("n", "no"):
-        set_sync_env(False)
-        print("  -> Disabled: settings.json will not be modified")
+        sync_env = False
     else:
-        # empty input -> keep current default
-        if SYNC_ENV_KEY not in load_config():
-            set_sync_env(current_sync)
+        sync_env = current_sync
 
     # ---- inject shell functions ----
     candidates = shell_config_candidates()
     existing_files = [p for p in candidates if p.exists()]
     target = existing_files[0] if existing_files else candidates[0]
 
-    write_shell_integration(target)
+    write_shell_integration(target, claude_path, sync_env)
     print("Written to {}. Run:".format(target))
     print("    source {}".format(target))
 

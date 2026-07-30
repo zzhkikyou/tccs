@@ -139,8 +139,8 @@ class TestSetup(unittest.TestCase):
             content = bashrc.read_text()
             self.assertIn("tccs-switch", content)
             self.assertIn("tccs-refresh", content)
-            self.assertIn("# >>> tccs initialized v2 >>>", content)
-            self.assertIn("# <<< tccs initialized v2 <<<", content)
+            self.assertIn("# >>> tccs initialized v3 >>>", content)
+            self.assertIn("# <<< tccs initialized v3 <<<", content)
             self.assertIn("tccs-env()", content)
             self.assertTrue((Path(home) / ".tccs" / "llm_example.json").exists())
         finally:
@@ -183,21 +183,19 @@ class TestSetup(unittest.TestCase):
             shutil.rmtree(home)
 
 class TestConfig(unittest.TestCase):
-    def test_list_reads_config_values(self):
-        """tccs -l reads claude_path and sync_env from config.json."""
+    def test_list_reads_env_vars(self):
+        """tccs -l reads claude_path and sync_env from env vars."""
         home = tempfile.mkdtemp()
         try:
-            tccs_dir = Path(home) / ".tccs"
-            tccs_dir.mkdir(mode=0o700)
-            # Use a path that actually exists so the fallback is not triggered.
             custom_claude = Path(home) / "custom" / ".claude"
             custom_claude.mkdir(parents=True)
-            config = {
-                "claude_path": str(custom_claude),
-                "sync_env": False,
-            }
-            (tccs_dir / "config.json").write_text(json.dumps(config) + "\n")
-            result = run_tccs(["-l"], home)
+            result = run_tccs(
+                ["-l"], home,
+                env_extra={
+                    "TCCS_CLAUDE_PATH": str(custom_claude),
+                    "TCCS_SYNC_ENV": "false",
+                },
+            )
             self.assertEqual(result.returncode, 0)
             self.assertIn("Claude path: {}".format(custom_claude), result.stdout)
             self.assertIn("Sync to settings.json: No", result.stdout)
@@ -212,11 +210,10 @@ class TestConfig(unittest.TestCase):
             default_claude = Path(home) / ".claude"
             default_claude.mkdir(parents=True)
 
-            tccs_dir = Path(home) / ".tccs"
-            tccs_dir.mkdir(mode=0o700)
-            config = {"claude_path": "/nonexistent/path/.claude"}
-            (tccs_dir / "config.json").write_text(json.dumps(config) + "\n")
-            result = run_tccs(["-l"], home)
+            result = run_tccs(
+                ["-l"], home,
+                env_extra={"TCCS_CLAUDE_PATH": "/nonexistent/path/.claude"},
+            )
             self.assertEqual(result.returncode, 0)
             self.assertIn(
                 "Warning: configured claude_path '/nonexistent/path/.claude' not found",
@@ -228,28 +225,39 @@ class TestConfig(unittest.TestCase):
         finally:
             shutil.rmtree(home)
 
-    def test_claude_path_stores_tilde_unexpanded(self):
-        """claude_path is stored with ~ as-is for cross-machine portability."""
+    def test_claude_path_stores_tilde_in_shell_block(self):
+        """claude_path is stored with ~ as-is in the shell integration block."""
         home = tempfile.mkdtemp()
         try:
             result = run_tccs([], home, input="~/work/.claude\nn\n")
             self.assertEqual(result.returncode, 0)
-            config = json.loads(
-                (Path(home) / ".tccs" / "config.json").read_text()
-            )
-            self.assertEqual(config["claude_path"], "~/work/.claude")
+            bashrc = Path(home) / ".bashrc"
+            content = bashrc.read_text()
+            self.assertIn('export TCCS_CLAUDE_PATH="~/work/.claude"', content)
         finally:
             shutil.rmtree(home)
 
-    def test_setup_persists_config(self):
-        """Interactive setup persists the chosen claude_path and sync_env."""
+    def test_setup_shell_block_has_env_vars(self):
+        """Interactive setup writes chosen values into the shell block."""
         home = tempfile.mkdtemp()
         try:
             custom_claude = Path(home) / "custom"
             custom_claude.mkdir(parents=True)
             result = run_tccs([], home, input="{}\nn\n".format(custom_claude))
             self.assertEqual(result.returncode, 0)
-            result = run_tccs(["-l"], home)
+            # Values are stored in the shell block as env vars
+            bashrc = Path(home) / ".bashrc"
+            content = bashrc.read_text()
+            self.assertIn('export TCCS_CLAUDE_PATH="{}"'.format(custom_claude), content)
+            self.assertIn('export TCCS_SYNC_ENV="false"', content)
+            # With env vars set, -l reflects the values
+            result = run_tccs(
+                ["-l"], home,
+                env_extra={
+                    "TCCS_CLAUDE_PATH": str(custom_claude),
+                    "TCCS_SYNC_ENV": "false",
+                },
+            )
             self.assertIn("Claude path: {}".format(custom_claude), result.stdout)
             self.assertIn("Sync to settings.json: No", result.stdout)
         finally:
@@ -390,17 +398,16 @@ class TestSettingsJsonSync(unittest.TestCase):
         """tccs -w leaves settings.json alone when sync_env=False."""
         home = tempfile.mkdtemp()
         try:
-            tccs_dir = Path(home) / ".tccs"
-            tccs_dir.mkdir(mode=0o700)
-            (tccs_dir / "config.json").write_text('{"sync_env": false}\n')
-
             claude_dir = Path(home) / ".claude"
             claude_dir.mkdir()
             settings = claude_dir / "settings.json"
             settings.write_text('{"env": {"OLD": "val"}, "other": 1}\n')
 
             self._create_profile(home, "foo", {"API": "secret"})
-            result = run_tccs(["-w", "foo"], home)
+            result = run_tccs(
+                ["-w", "foo"], home,
+                env_extra={"TCCS_SYNC_ENV": "false"},
+            )
             self.assertEqual(result.returncode, 0)
 
             data = json.loads(settings.read_text())
@@ -435,19 +442,19 @@ class TestSettingsJsonSync(unittest.TestCase):
         """tccs -d on active profile leaves settings.json alone when sync_env=False."""
         home = tempfile.mkdtemp()
         try:
-            tccs_dir = Path(home) / ".tccs"
-            tccs_dir.mkdir(mode=0o700)
-            (tccs_dir / "config.json").write_text('{"sync_env": false}\n')
-
             claude_dir = Path(home) / ".claude"
             claude_dir.mkdir()
             settings = claude_dir / "settings.json"
             settings.write_text('{"env": {"API": "secret"}, "other": 1}\n')
 
             self._create_profile(home, "foo", {"API": "secret"})
+            tccs_dir = Path(home) / ".tccs"
             (tccs_dir / "llm.json").symlink_to("llm_foo.json")
 
-            result = run_tccs(["-d", "foo"], home)
+            result = run_tccs(
+                ["-d", "foo"], home,
+                env_extra={"TCCS_SYNC_ENV": "false"},
+            )
             self.assertEqual(result.returncode, 0)
 
             data = json.loads(settings.read_text())
